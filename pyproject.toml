@@ -1,0 +1,15 @@
+[project]
+name = "mcp-client"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "fastapi>=0.121.1",
+    "langchain>=0.3.0,<0.4.0",
+    "langchain-google-genai>=2.1.12",
+    "langchain-google-vertexai==2.0.0",
+    "mcp[cli]>=1.21.0",
+    "openai>=2.7.1",
+    "python-dotenv>=1.2.1",
+]
