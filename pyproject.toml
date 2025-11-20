@@ -10,7 +10,9 @@ dependencies = [
     "langchain-google-genai>=2.1.12",
     "langchain-google-vertexai==2.0.0",
     "langchain-ollama>=0.3.10",
+    "langchain-openai>=0.3.35",
     "mcp[cli]>=1.21.0",
     "openai>=2.7.1",
     "python-dotenv>=1.2.1",
+    "tiktoken",
 ]

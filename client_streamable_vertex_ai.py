@@ -10,11 +10,13 @@ import os
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Sequence
+from textwrap import shorten
 
 from dotenv import find_dotenv, load_dotenv
 from langchain_core.messages import HumanMessage, ToolMessage, BaseMessage, BaseMessageChunk
 from langchain_core.runnables import Runnable
 from langchain_google_genai import ChatGoogleGenerativeAI as ChatVertexAI
+from langchain_openai import ChatOpenAI
 from langchain_ollama import ChatOllama
 import tiktoken
 from tiktoken import Encoding
@@ -86,6 +88,36 @@ def _render_content_blocks(blocks: Sequence[types.ContentBlock]) -> str:
     return "\n".join(part for part in rendered if part)
 
 
+
+def _build_llm_openai() -> ChatOpenAI:
+    """Build an OpenAI LLM client with validated configuration."""
+    model_name = os.getenv("OPENAI_MODEL", "gpt-4-turbo")
+
+    try:
+        temperature = float(os.getenv("OPENAI_TEMPERATURE", "0"))
+        validate_temperature(temperature)
+    except ValueError as e:
+        raise ConfigurationError(
+            f"Invalid OPENAI_TEMPERATURE value: {os.getenv('OPENAI_TEMPERATURE')}",
+            config_key="OPENAI_TEMPERATURE",
+        ) from e
+
+    api_key = validate_environment_variable("OPENAI_API_KEY", required=True)
+
+    logger.info("Building OpenAI LLM with model=%s, temperature=%s", model_name, temperature)
+
+    try:
+        return ChatOpenAI(
+            model_name=model_name,
+            openai_api_key=api_key,
+            temperature=temperature,
+        )
+    except Exception as e:
+        raise LLMError(
+            f"Failed to initialize OpenAI LLM: {str(e)}",
+            model=model_name,
+            reason=str(e),
+        ) from e
 
 
 def _build_llm() -> ChatVertexAI:
@@ -373,7 +405,7 @@ class MCPChatClient:
     """High level facade that orchestrates MCP tool calls with Vertex AI."""
 
     def __init__(self, llm: ChatVertexAI | None = None) -> None:
-        self._llm = llm or _build_llm()
+        self._llm = llm or _build_llm_openai()
         self._initialized = False
         # Simplified for testing
         self._bound_llm: Runnable | None = None
@@ -503,6 +535,15 @@ class MCPChatClient:
         """Get the bound LLM instance."""
         return self._bound_llm
 
+    def _log_prompt_tokens(self, messages: list[HumanMessage | BaseMessage | ToolMessage], *, context: str) -> None:
+        """Log token usage for a prompt without blocking execution on failures."""
+        try:
+            encoding = tiktoken.get_encoding(DEFAULT_ENCODING)
+            token_count = get_token_count(messages, encoding)
+            logger.info("%s: %d token(s) across %d message(s)", context, token_count, len(messages))
+        except Exception as e:
+            logger.debug("Could not log token usage for %s: %s", context, e)
+
     def _truncate_messages(
         self, messages: list[HumanMessage | BaseMessage | ToolMessage]
     ) -> list[HumanMessage | BaseMessage | ToolMessage]:
@@ -521,6 +562,13 @@ class MCPChatClient:
         try:
             encoding = tiktoken.get_encoding(DEFAULT_ENCODING)
             token_count = get_token_count(messages, encoding)
+
+            logger.debug(
+                "Prompt tokens before truncation: %d token(s) across %d message(s)",
+                token_count,
+                len(messages),
+            )
+
 
             if token_count > MAX_PROMPT_TOKENS:
                 logger.warning(
@@ -557,6 +605,51 @@ class MCPChatClient:
 
         return messages
 
+    async def _compress_tool_payload(
+        self,
+        content: str,
+        *,
+        max_tokens: int = 2000,
+        chunk_tokens: int = 800,
+    ) -> str:
+        """
+        Summarize large tool payloads so a single tool result cannot exceed the prompt budget.
+        """
+        if not content or not self._llm:
+            return content
+
+        try:
+            encoding = tiktoken.get_encoding(DEFAULT_ENCODING)
+        except Exception as e:
+            logger.error("Could not create encoding for compression: %s", e)
+            return shorten(content, width=4000, placeholder=" ...") if len(content) > 4000 else content
+
+        try:
+            if len(encoding.encode(content)) <= max_tokens:
+                return content
+
+            def _split_by_tokens(text: str) -> list[str]:
+                tokens = encoding.encode(text)
+                return [encoding.decode(tokens[i:i + chunk_tokens]) for i in range(0, len(tokens), chunk_tokens)]
+
+            summaries: list[str] = []
+            for idx, chunk in enumerate(_split_by_tokens(content)):
+                prompt = (
+                    f"Summarize tool output chunk {idx + 1}. Keep entities, ids, timestamps, metrics, and counts. "
+                    f"Drop verbose text and repetition. Keep under {chunk_tokens} tokens."
+                )
+                summary_msg = await self._llm.ainvoke([HumanMessage(content=f"{prompt}\n\n{chunk}")])
+                summaries.append(ai_content_to_str(summary_msg))
+
+            merged = "\n".join(summaries)
+            if len(encoding.encode(merged)) > max_tokens:
+                merged = shorten(merged, width=4000, placeholder=" ...")
+            return merged
+
+        except Exception as e:
+            logger.error("Failed to compress tool payload: %s", e)
+            return shorten(content, width=4000, placeholder=" ...") if len(content) > 4000 else content
+
     async def ainvoke_llm(self, messages: list[HumanMessage | BaseMessage | ToolMessage]) -> BaseMessage:
         """
         Invokes the LLM with a list of messages without any tool loop logic.
@@ -576,6 +669,7 @@ class MCPChatClient:
             raise InitializationError("Client is not initialized or has no tools bound")
 
         messages = self._truncate_messages(messages)
+        self._log_prompt_tokens(messages, context="LLM invoke prompt")
         logger.debug("Invoking LLM with %d messages", len(messages))
 
         try:
@@ -603,6 +697,7 @@ class MCPChatClient:
             raise InitializationError("Client is not initialized or has no tools bound")
 
         messages = self._truncate_messages(messages)
+        self._log_prompt_tokens(messages, context="LLM streaming prompt")
         logger.debug("Streaming LLM with %d messages", len(messages))
 
         try:
@@ -675,6 +770,9 @@ class MCPChatClient:
             else:
                 final_payload = payload
 
+            if final_payload:
+                final_payload = await self._compress_tool_payload(final_payload, max_tokens=3000)
+
             return ToolMessage(
                 content=final_payload or "(no content returned)",
                 tool_call_id=f"agent_call_{tool_name}",
@@ -705,6 +803,7 @@ class MCPChatClient:
         messages: list[HumanMessage | BaseMessage | ToolMessage] = [HumanMessage(content=query)] # Changed type hint
 
         while True:
+            self._log_prompt_tokens(messages, context="LLM tool-loop prompt")
             stream = llm.astream(messages)
 
             collected_chunks = []
@@ -762,6 +861,9 @@ class MCPChatClient:
                 else:
                     final_payload = payload
 
+                if final_payload:
+                    final_payload = await self._compress_tool_payload(final_payload, max_tokens=3000)
+
                 tool_messages.append(
                     ToolMessage(
                         content=final_payload or "(no content returned)",
@@ -798,3 +900,12 @@ async def run(query: str) -> AsyncIterator[str]:
 
 
 __all__ = ["MCPChatClient", "run", "get_client"]
+
+
+
+
+
+
+
+
+
