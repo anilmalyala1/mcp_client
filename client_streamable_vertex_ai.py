@@ -35,6 +35,7 @@ from constants import (
     DEFAULT_MCP_SERVER_NAME,
     FALLBACK_MAX_MESSAGES,
     DEFAULT_ENCODING,
+    DEFAULT_TOOL_RESPONSE_MAX_TOKENS,
 )
 from exceptions import (
     InitializationError,
@@ -317,11 +318,16 @@ def _convert_tools(
 class MCPChatClient:
     """High level facade that orchestrates MCP tool calls with Vertex AI."""
 
-    def __init__(self, llm: BaseChatModel | None = None) -> None:
+    def __init__(self, llm: ChatVertexAI | None = None) -> None:
         self._llm = llm or LLMFactory.create_llm()
         self._initialized = False
         # Simplified for testing
         self._bound_llm: Runnable | None = None
+        self._exit_stack: AsyncExitStack | None = None
+        self._sessions: dict[str, ClientSession] = {}
+        self._tool_lookup: dict[str, tuple[str, str]] = {}
+        self._tool_schemas: list[dict[str, Any]] = []
+        self._tool_call_cache: dict[str, str] = {}  # For deduplication
 
     async def initialize(self) -> None:
         """
@@ -448,6 +454,94 @@ class MCPChatClient:
         """Get the bound LLM instance."""
         return self._bound_llm
 
+    async def _select_relevant_tools(self, query: str, max_tools: int = 5) -> list[str]:
+        """
+        Select relevant tools for a query using a lightweight LLM call.
+
+        Args:
+            query: The user's query
+            max_tools: Maximum number of tools to select
+
+        Returns:
+            List of relevant tool names
+        """
+        if not self._tool_schemas:
+            return []
+
+        # Create concise tool list (name only for brevity)
+        tool_names = [schema.get("name", "") for schema in self._tool_schemas]
+        tools_compact = ", ".join(tool_names)
+
+        # Ultra-concise prompt
+        selection_prompt = f'Q: "{query}"\nTools: {tools_compact}\nSelect {max_tools}: ["t1","t2",...]'
+
+        try:
+            # Use the base LLM (not bound to tools) for selection
+            response = await self._llm.ainvoke([HumanMessage(content=selection_prompt)])
+            response_text = ai_content_to_str(response).strip()
+            
+            # Parse JSON response
+            import json
+            response_text = response_text.removeprefix("```json").removesuffix("```").strip()
+            selected_tools = json.loads(response_text)
+            
+            if isinstance(selected_tools, list):
+                # Validate tool names exist
+                valid_tools = [t for t in selected_tools if any(s["name"] == t for s in self._tool_schemas)]
+                logger.info("Selected %d relevant tools from %d available", len(valid_tools), len(self._tool_schemas))
+                return valid_tools[:max_tools]
+        except Exception as e:
+            logger.warning("Tool selection failed: %s. Using all tools.", e)
+        
+        # Fallback: return all tools
+        return [s["name"] for s in self._tool_schemas]
+
+    def _get_tool_call_hash(self, tool_name: str, arguments: dict[str, Any]) -> str:
+        """Generate a hash for a tool call to detect duplicates."""
+        import hashlib
+        call_str = f"{tool_name}:{json.dumps(arguments, sort_keys=True)}"
+        return hashlib.md5(call_str.encode()).hexdigest()
+
+    async def _summarize_old_messages(
+        self, messages: list[HumanMessage | BaseMessage | ToolMessage]
+    ) -> list[HumanMessage | BaseMessage | ToolMessage]:
+        """
+        Summarize old messages when history gets too long.
+        
+        Args:
+            messages: List of messages to potentially summarize
+            
+        Returns:
+            List with old messages summarized into a single context message
+        """
+        if len(messages) <= 3:
+            return messages
+        
+        # Calculate split point (summarize oldest 50%)
+        split_idx = len(messages) // 2
+        old_messages = messages[:split_idx]
+        recent_messages = messages[split_idx:]
+        
+        # Create summary of old messages
+        old_content = "\n".join([
+            f"{msg.__class__.__name__}: {ai_content_to_str(msg)[:200]}"
+            for msg in old_messages
+        ])
+        
+        summary_prompt = f"Summarize this conversation history in 2-3 sentences:\n{old_content}"
+        
+        try:
+            summary_response = await self._llm.ainvoke([HumanMessage(content=summary_prompt)])
+            summary_text = ai_content_to_str(summary_response)
+            
+            # Replace old messages with summary
+            summary_message = HumanMessage(content=f"[Previous context: {summary_text}]")
+            logger.info("Summarized %d old messages into context", len(old_messages))
+            return [summary_message] + recent_messages
+        except Exception as e:
+            logger.warning("Message summarization failed: %s. Keeping original messages.", e)
+            return messages
+
     def _log_prompt_tokens(self, messages: list[HumanMessage | BaseMessage | ToolMessage], *, context: str) -> None:
         """Log token usage for a prompt without blocking execution on failures."""
         try:
@@ -457,7 +551,7 @@ class MCPChatClient:
         except Exception as e:
             logger.debug("Could not log token usage for %s: %s", context, e)
 
-    def _truncate_messages(
+    async def _truncate_messages(
         self, messages: list[HumanMessage | BaseMessage | ToolMessage]
     ) -> list[HumanMessage | BaseMessage | ToolMessage]:
         """
@@ -485,11 +579,19 @@ class MCPChatClient:
 
             if token_count > MAX_PROMPT_TOKENS:
                 logger.warning(
-                    "Token count %d exceeds limit %d. Truncating message history...",
+                    "Token count %d exceeds limit %d. Attempting summarization first...",
                     token_count,
                     MAX_PROMPT_TOKENS
                 )
+                
+                # Try summarization first (better than truncation)
+                enable_summarization = os.getenv("ENABLE_MESSAGE_SUMMARIZATION", "true").lower() == "true"
+                if enable_summarization and len(messages) > 3:
+                    messages = await self._summarize_old_messages(messages)
+                    token_count = get_token_count(messages, encoding)
+                    logger.info("After summarization: %d tokens", token_count)
 
+                # If still over limit, truncate
                 while get_token_count(messages, encoding) > MAX_PROMPT_TOKENS:
                     if len(messages) <= 1:
                         # Cannot truncate further
@@ -533,7 +635,7 @@ class MCPChatClient:
 
         # Use env var or default if max_tokens not provided
         if max_tokens is None:
-            max_tokens = int(os.getenv("MCP_TOOL_RESPONSE_MAX_TOKENS", "2000"))
+            max_tokens = int(os.getenv("MCP_TOOL_RESPONSE_MAX_TOKENS", str(DEFAULT_TOOL_RESPONSE_MAX_TOKENS)))
 
         try:
             encoding = tiktoken.get_encoding(DEFAULT_ENCODING)
@@ -739,7 +841,27 @@ class MCPChatClient:
         if not self._bound_llm:
             raise RuntimeError("Client initialization failed.")
 
-        llm = self._bound_llm
+        # Selective tool binding: select relevant tools for this query
+        enable_selective = os.getenv("ENABLE_SELECTIVE_BINDING", "true").lower() == "true"
+        max_tools = int(os.getenv("MAX_TOOLS_PER_QUERY", "5"))
+        
+        if enable_selective and self._tool_schemas:
+            selected_tool_names = await self._select_relevant_tools(query, max_tools=max_tools)
+            
+            # Filter tool schemas to only selected ones
+            selected_schemas = [s for s in self._tool_schemas if s["name"] in selected_tool_names]
+            
+            if selected_schemas:
+                # Create a new LLM binding with only selected tools
+                llm = self._llm.bind_tools(selected_schemas)
+                logger.info("Using %d selected tools instead of %d total", len(selected_schemas), len(self._tool_schemas))
+            else:
+                # Fallback to all tools if selection failed
+                llm = self._bound_llm
+                logger.warning("Tool selection returned empty, using all tools")
+        else:
+            llm = self._bound_llm
+            
         messages: list[HumanMessage | BaseMessage | ToolMessage] = [HumanMessage(content=query)] # Changed type hint
 
         while True:
@@ -784,25 +906,37 @@ class MCPChatClient:
                 call_id = tool_call.get("id") or tool_call_name
                 arguments = tool_call.get("args") or {}
 
-                logger.debug(
-                    "Executing tool %s on server %s with args %s",
-                    original_tool_name,
-                    server_name,
-                    arguments,
-                )
-                session = self._sessions[server_name]
-                result = await session.call_tool(original_tool_name, arguments=arguments)
-                payload = _render_content_blocks(result.content)
-
-                parser = get_parser(original_tool_name)
-                if parser:
-                    logger.debug("Using custom parser for tool '%s'", original_tool_name)
-                    final_payload = parser(payload)
+                # Check for duplicate tool calls
+                enable_dedup = os.getenv("ENABLE_TOOL_DEDUPLICATION", "true").lower() == "true"
+                tool_hash = self._get_tool_call_hash(original_tool_name, arguments)
+                
+                if enable_dedup and tool_hash in self._tool_call_cache:
+                    logger.info("Duplicate tool call detected for %s, using cached result", original_tool_name)
+                    final_payload = f"[Duplicate call - same as previous {original_tool_name} result]"
                 else:
-                    final_payload = payload
+                    logger.debug(
+                        "Executing tool %s on server %s with args %s",
+                        original_tool_name,
+                        server_name,
+                        arguments,
+                    )
+                    session = self._sessions[server_name]
+                    result = await session.call_tool(original_tool_name, arguments=arguments)
+                    payload = _render_content_blocks(result.content)
 
-                if final_payload:
-                    final_payload = await self._compress_tool_payload(final_payload, max_tokens=3000)
+                    parser = get_parser(original_tool_name)
+                    if parser:
+                        logger.debug("Using custom parser for tool '%s'", original_tool_name)
+                        final_payload = parser(payload)
+                    else:
+                        final_payload = payload
+
+                    if final_payload:
+                        final_payload = await self._compress_tool_payload(final_payload, max_tokens=DEFAULT_TOOL_RESPONSE_MAX_TOKENS)
+                    
+                    # Cache the result
+                    if enable_dedup:
+                        self._tool_call_cache[tool_hash] = final_payload or "(no content)"
 
                 tool_messages.append(
                     ToolMessage(
@@ -813,7 +947,7 @@ class MCPChatClient:
                 )
             messages.extend(tool_messages)
 
-            messages = self._truncate_messages(messages)
+            messages = await self._truncate_messages(messages)
 
 
 

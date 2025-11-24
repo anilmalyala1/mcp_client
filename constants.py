@@ -5,8 +5,11 @@ Constants used throughout the MCP client.
 from __future__ import annotations
 
 # Token limits
-MAX_PROMPT_TOKENS = 6000
+MAX_PROMPT_TOKENS = 2000
 """Maximum number of tokens allowed in the prompt history."""
+
+DEFAULT_TOOL_RESPONSE_MAX_TOKENS = 800
+"""Default maximum tokens for a single tool response before compression."""
 
 FALLBACK_MAX_MESSAGES = 15
 """Fallback maximum number of messages when token counting fails."""
@@ -84,3 +87,13 @@ ELASTIC_SEARCH_TOOL = "elastic_search"
 # Encoding
 DEFAULT_ENCODING = "cl100k_base"
 """Default tiktoken encoding to use for token counting."""
+
+__all__ = [
+    "MAX_PROMPT_TOKENS",
+    "DEFAULT_TOOL_RESPONSE_MAX_TOKENS",
+    "FALLBACK_MAX_MESSAGES",
+    "DEFAULT_VERTEXAI_MODEL",
+    "DEFAULT_OLLAMA_MODEL",
+    "DEFAULT_TEMPERATURE",
+    "DEFAULT_ENCODING",
+]

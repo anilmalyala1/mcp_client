@@ -138,4 +138,21 @@ The client includes built-in handling for rate limits (429 errors) with exponent
 
 Large tool outputs are automatically compressed to fit within the context window.
 
--   **`MCP_TOOL_RESPONSE_MAX_TOKENS`**: Maximum tokens for a single tool response before compression kicks in (default: 2000).
+-   **`MCP_TOOL_RESPONSE_MAX_TOKENS`**: Maximum tokens for a single tool response before compression kicks in (default: 800).
+
+### Selective Tool Binding (New)
+
+To reduce input tokens, the client intelligently selects only relevant tools for each query instead of sending all tool schemas.
+
+-   **`ENABLE_SELECTIVE_BINDING`**: Enable/disable selective tool binding (default: `true`).
+-   **`MAX_TOOLS_PER_QUERY`**: Maximum number of tools to select per query (default: 5).
+
+### Advanced Optimizations (New)
+
+Additional optimizations to further reduce token usage:
+
+-   **`ENABLE_MESSAGE_SUMMARIZATION`**: Summarize old messages instead of truncating (default: `true`).
+-   **`ENABLE_TOOL_DEDUPLICATION`**: Detect and deduplicate repeated tool calls (default: `true`).
+
+> [!NOTE]
+> The default `MAX_PROMPT_TOKENS` has been reduced from 6000 to 2000 to optimize input token usage and reduce costs. You can override this in `constants.py` if needed.
