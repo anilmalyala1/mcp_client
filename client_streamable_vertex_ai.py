@@ -15,6 +15,7 @@ from textwrap import shorten
 from dotenv import find_dotenv, load_dotenv
 from langchain_core.messages import HumanMessage, ToolMessage, BaseMessage, BaseMessageChunk
 from langchain_core.runnables import Runnable
+from langchain_core.language_models import BaseChatModel
 from langchain_google_genai import ChatGoogleGenerativeAI as ChatVertexAI
 from langchain_openai import ChatOpenAI
 from langchain_ollama import ChatOllama
@@ -53,6 +54,7 @@ from validation import (
     validate_token_limit,
     validate_tool_arguments,
 )
+from llm_factory import LLMFactory, LLMProvider
 
 logger = logging.getLogger(__name__)
 
@@ -89,96 +91,7 @@ def _render_content_blocks(blocks: Sequence[types.ContentBlock]) -> str:
 
 
 
-def _build_llm_openai() -> ChatOpenAI:
-    """Build an OpenAI LLM client with validated configuration."""
-    model_name = os.getenv("OPENAI_MODEL", "gpt-4-turbo")
 
-    try:
-        temperature = float(os.getenv("OPENAI_TEMPERATURE", "0"))
-        validate_temperature(temperature)
-    except ValueError as e:
-        raise ConfigurationError(
-            f"Invalid OPENAI_TEMPERATURE value: {os.getenv('OPENAI_TEMPERATURE')}",
-            config_key="OPENAI_TEMPERATURE",
-        ) from e
-
-    api_key = validate_environment_variable("OPENAI_API_KEY", required=True)
-
-    logger.info("Building OpenAI LLM with model=%s, temperature=%s", model_name, temperature)
-
-    try:
-        return ChatOpenAI(
-            model_name=model_name,
-            openai_api_key=api_key,
-            temperature=temperature,
-        )
-    except Exception as e:
-        raise LLMError(
-            f"Failed to initialize OpenAI LLM: {str(e)}",
-            model=model_name,
-            reason=str(e),
-        ) from e
-
-
-def _build_llm() -> ChatVertexAI:
-    """Build a Vertex AI LLM client with validated configuration."""
-    model_name = os.getenv("VERTEXAI_MODEL", DEFAULT_VERTEXAI_MODEL)
-
-    try:
-        temperature = float(os.getenv("VERTEXAI_TEMPERATURE", str(DEFAULT_TEMPERATURE)))
-        validate_temperature(temperature)
-    except ValueError as e:
-        raise ConfigurationError(
-            f"Invalid VERTEXAI_TEMPERATURE value: {os.getenv('VERTEXAI_TEMPERATURE')}",
-            config_key="VERTEXAI_TEMPERATURE",
-        ) from e
-
-    api_key = validate_environment_variable("GOOGLE_API_KEY", required=True)
-
-    logger.info("Building Vertex AI LLM with model=%s, temperature=%s", model_name, temperature)
-
-    try:
-        return ChatVertexAI(
-            model=model_name,
-            api_key=api_key,
-            temperature=temperature,
-            convert_system_message_to_human=True,
-        )
-    except Exception as e:
-        raise LLMError(
-            f"Failed to initialize Vertex AI LLM: {str(e)}",
-            model=model_name,
-            reason=str(e),
-        ) from e
-
-def _build_llm_ollama() -> ChatOllama:
-    """Build an Ollama LLM client with validated configuration."""
-    model_name = os.getenv("OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL)
-    base_url = os.getenv("OLLAMA_BASE_URL", DEFAULT_OLLAMA_BASE_URL)
-
-    try:
-        temperature = float(os.getenv("OLLAMA_TEMPERATURE", str(DEFAULT_TEMPERATURE)))
-        validate_temperature(temperature)
-    except ValueError as e:
-        raise ConfigurationError(
-            f"Invalid OLLAMA_TEMPERATURE value: {os.getenv('OLLAMA_TEMPERATURE')}",
-            config_key="OLLAMA_TEMPERATURE",
-        ) from e
-
-    logger.info("Building Ollama LLM with model=%s, base_url=%s, temperature=%s", model_name, base_url, temperature)
-
-    try:
-        return ChatOllama(
-            model=model_name,
-            base_url=base_url,
-            temperature=temperature,
-        )
-    except Exception as e:
-        raise LLMError(
-            f"Failed to initialize Ollama LLM: {str(e)}",
-            model=model_name,
-            reason=str(e),
-        ) from e
 
 
 def _parse_server_mapping_fragment(fragment: str) -> MCPServerConfig:
@@ -404,8 +317,8 @@ def _convert_tools(
 class MCPChatClient:
     """High level facade that orchestrates MCP tool calls with Vertex AI."""
 
-    def __init__(self, llm: ChatVertexAI | None = None) -> None:
-        self._llm = llm or _build_llm_openai()
+    def __init__(self, llm: BaseChatModel | None = None) -> None:
+        self._llm = llm or LLMFactory.create_llm()
         self._initialized = False
         # Simplified for testing
         self._bound_llm: Runnable | None = None
@@ -609,7 +522,7 @@ class MCPChatClient:
         self,
         content: str,
         *,
-        max_tokens: int = 2000,
+        max_tokens: int | None = None,
         chunk_tokens: int = 800,
     ) -> str:
         """
@@ -617,6 +530,10 @@ class MCPChatClient:
         """
         if not content or not self._llm:
             return content
+
+        # Use env var or default if max_tokens not provided
+        if max_tokens is None:
+            max_tokens = int(os.getenv("MCP_TOOL_RESPONSE_MAX_TOKENS", "2000"))
 
         try:
             encoding = tiktoken.get_encoding(DEFAULT_ENCODING)
@@ -628,22 +545,45 @@ class MCPChatClient:
             if len(encoding.encode(content)) <= max_tokens:
                 return content
 
+            logger.info("Compressing tool output of length %d (exceeds %d tokens)", len(content), max_tokens)
+
             def _split_by_tokens(text: str) -> list[str]:
                 tokens = encoding.encode(text)
                 return [encoding.decode(tokens[i:i + chunk_tokens]) for i in range(0, len(tokens), chunk_tokens)]
 
             summaries: list[str] = []
-            for idx, chunk in enumerate(_split_by_tokens(content)):
+            chunks = _split_by_tokens(content)
+            
+            # Limit number of chunks to avoid excessive LLM calls for massive files
+            MAX_CHUNKS = 5
+            if len(chunks) > MAX_CHUNKS:
+                logger.warning("Tool output too large (%d chunks), summarizing first %d only", len(chunks), MAX_CHUNKS)
+                chunks = chunks[:MAX_CHUNKS]
+                chunks.append("... (remaining content truncated) ...")
+
+            for idx, chunk in enumerate(chunks):
+                if chunk == "... (remaining content truncated) ...":
+                    summaries.append(chunk)
+                    continue
+
                 prompt = (
-                    f"Summarize tool output chunk {idx + 1}. Keep entities, ids, timestamps, metrics, and counts. "
-                    f"Drop verbose text and repetition. Keep under {chunk_tokens} tokens."
+                    f"Compress this tool output chunk ({idx + 1}/{len(chunks)}). "
+                    "EXTREMELY CONCISE. Preserve IDs, metrics, errors, and key data. "
+                    "Remove formatting, whitespace, and verbose descriptions. "
+                    f"Max {chunk_tokens // 2} tokens."
                 )
-                summary_msg = await self._llm.ainvoke([HumanMessage(content=f"{prompt}\n\n{chunk}")])
-                summaries.append(ai_content_to_str(summary_msg))
+                try:
+                    summary_msg = await self._llm.ainvoke([HumanMessage(content=f"{prompt}\n\n{chunk}")])
+                    summaries.append(ai_content_to_str(summary_msg))
+                except Exception as e:
+                    logger.warning("Failed to summarize chunk %d: %s", idx, e)
+                    summaries.append(shorten(chunk, width=500, placeholder="..."))
 
             merged = "\n".join(summaries)
             if len(encoding.encode(merged)) > max_tokens:
-                merged = shorten(merged, width=4000, placeholder=" ...")
+                logger.warning("Compressed content still exceeds limit, truncating...")
+                merged = shorten(merged, width=max_tokens * 4, placeholder=" ...") # Approx chars
+            
             return merged
 
         except Exception as e:

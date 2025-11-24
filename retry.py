@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from typing import Any, Callable, TypeVar, cast
 
 from config import RetryConfig
@@ -51,11 +52,28 @@ class RetryHandler:
             TimeoutError,
         )
 
-        return isinstance(exception, retryable_exceptions)
+        if isinstance(exception, retryable_exceptions):
+            return True
+
+        # Check for 429 Rate Limit or Resource Exhausted
+        ex_str = str(exception).lower()
+        if "429" in ex_str or "rate limit" in ex_str or "resource exhausted" in ex_str:
+            logger.warning("Detected rate limit/resource exhaustion: %s", exception)
+            return True
+
+        # Check for Google ResourceExhausted if available
+        try:
+            from google.api_core.exceptions import ResourceExhausted
+            if isinstance(exception, ResourceExhausted):
+                return True
+        except ImportError:
+            pass
+
+        return False
 
     def _calculate_wait_time(self, attempt: int) -> float:
         """
-        Calculate wait time using exponential backoff.
+        Calculate wait time using exponential backoff with optional jitter.
 
         Args:
             attempt: Current attempt number (0-indexed)
@@ -67,7 +85,35 @@ class RetryHandler:
             self.config.min_wait * (self.config.exponential_base ** attempt),
             self.config.max_wait,
         )
+        
+        if self.config.jitter:
+            # Add random jitter between 0 and 1 second (or smaller fraction of wait)
+            # Standard "Full Jitter" approach: random_between(0, wait)
+            # Or simple additive jitter. Here we use additive for simplicity but kept small.
+            wait += random.uniform(0, 1)
+            
         return wait
+
+    def _get_retry_after(self, exception: Exception) -> float | None:
+        """Extract retry-after value from exception if available."""
+        # Check for 'retry_after' attribute (common in some libs)
+        retry_after = getattr(exception, "retry_after", None)
+        if retry_after is not None:
+            try:
+                return float(retry_after)
+            except (ValueError, TypeError):
+                pass
+        
+        # Check for headers (e.g. OpenAI, HTTP exceptions)
+        headers = getattr(exception, "headers", None)
+        if headers and isinstance(headers, dict):
+            val = headers.get("Retry-After") or headers.get("retry-after")
+            if val:
+                try:
+                    return float(val)
+                except (ValueError, TypeError):
+                    pass
+        return None
 
     async def execute_with_retry(
         self,
@@ -116,6 +162,13 @@ class RetryHandler:
                     raise
 
                 wait_time = self._calculate_wait_time(attempt)
+                
+                # Check for explicit Retry-After header
+                retry_after = self._get_retry_after(e)
+                if retry_after:
+                    logger.warning("Respecting Retry-After header: %.2fs", retry_after)
+                    wait_time = max(wait_time, retry_after)
+
                 logger.warning(
                     "Operation failed: %s. Retrying in %.2fs (attempt %d/%d)",
                     e,

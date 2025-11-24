@@ -115,3 +115,27 @@ Several of the clients require environment variables to be set. You can create a
 -   **`MCP_API_KEY`**: An API key for the MCP server, if it requires authentication.
 -   **`MCP_SERVER_URL`**: The URL for the streamable HTTP MCP server, used by `client_streamable_vertex_ai.py`.
 -   **`MCP_SAMPLE_QUERY`**: A default query to use in the interactive clients.
+
+### LLM Configuration (New)
+
+You can switch between LLM providers using `LLM_PROVIDER`.
+
+-   **`LLM_PROVIDER`**: One of `openai`, `vertex`, `ollama` (default: `openai`).
+-   **`OPENAI_MODEL`**: Model name for OpenAI (default: `gpt-4-turbo`).
+-   **`VERTEXAI_MODEL`**: Model name for Vertex AI (default: `gemini-2.5-pro`).
+-   **`OLLAMA_MODEL`**: Model name for Ollama (default: `qwen3:4b`).
+-   **`OLLAMA_BASE_URL`**: Base URL for Ollama (default: `http://localhost:11434`).
+
+### Rate Limiting & Resilience
+
+The client includes built-in handling for rate limits (429 errors) with exponential backoff and jitter.
+
+-   **`MCP_MAX_RETRIES`**: Maximum number of retries (default: 3).
+-   **`MCP_RETRY_MIN_WAIT`**: Minimum wait time in seconds (default: 1.0).
+-   **`MCP_RETRY_MAX_WAIT`**: Maximum wait time in seconds (default: 10.0).
+
+### Context Compression
+
+Large tool outputs are automatically compressed to fit within the context window.
+
+-   **`MCP_TOOL_RESPONSE_MAX_TOKENS`**: Maximum tokens for a single tool response before compression kicks in (default: 2000).

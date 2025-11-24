@@ -139,6 +139,7 @@ class RetryConfig:
     min_wait: float = DEFAULT_RETRY_MIN_WAIT
     max_wait: float = DEFAULT_RETRY_MAX_WAIT
     exponential_base: int = 2
+    jitter: bool = True
 
     def __post_init__(self) -> None:
         """Validate retry configuration."""

@@ -47,7 +47,7 @@ app = FastAPI(title="MCP Chat API", version="1.0.0", lifespan=lifespan)
 class ChatRequest(BaseModel):
     """Request model for chat endpoint."""
 
-    query: str
+    prompt: str
 
 
 class ChatResponse(BaseModel):
@@ -63,7 +63,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
     Process a chat request.
 
     Args:
-        request: ChatRequest with query
+        request: ChatRequest with prompt
 
     Returns:
         ChatResponse with the answer
@@ -71,7 +71,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
     Raises:
         HTTPException: If processing fails
     """
-    logger.info("Received chat request: %s", request.query[:100])
+    logger.info("Received chat request: %s", request.prompt[:100])
 
     try:
         # Get the initialized client (now with await!)
@@ -79,7 +79,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
         # Collect the streamed response
         response_parts = []
-        async for chunk in client.run(request.query):
+        async for chunk in client.run(request.prompt):
             response_parts.append(chunk)
 
         full_response = "".join(response_parts)
@@ -88,10 +88,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
 
         return ChatResponse(
             response=full_response,
-            metadata={
-                "query_length": len(request.query),
-                "response_length": len(full_response),
-            },
+
         )
 
     except MCPError as exc:
@@ -115,7 +112,7 @@ async def chat_stream(request: ChatRequest):
     Process a chat request with streaming response.
 
     Args:
-        request: ChatRequest with query
+        request: ChatRequest with prompt
 
     Returns:
         StreamingResponse with chunks
@@ -123,13 +120,13 @@ async def chat_stream(request: ChatRequest):
     Raises:
         HTTPException: If processing fails
     """
-    logger.info("Received streaming chat request: %s", request.query[:100])
+    logger.info("Received streaming chat request: %s", request.prompt[:100])
 
     async def generate():
         """Generate response chunks."""
         try:
             client = await get_client()
-            async for chunk in client.run(request.query):
+            async for chunk in client.run(request.prompt):
                 yield chunk
         except MCPError as exc:
             logger.error("MCP error in streaming: %s", exc)
